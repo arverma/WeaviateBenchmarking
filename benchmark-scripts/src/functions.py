@@ -5,6 +5,7 @@ import time
 import datetime
 import subprocess
 import h5py
+import pickle
 import weaviate
 import loguru
 
@@ -18,8 +19,7 @@ def add_batch(client, c, vector_len):
     stop_time = datetime.datetime.now()
     handle_results(results)
     run_time = stop_time - start_time
-    if (c % 10000) == 0:
-        loguru.logger.info('Import status => added ' + str(c) + ' of ' + str(vector_len) + ' objects')
+    loguru.logger.info('Import status => added ' + str(c) + ' of ' + str(vector_len) + ' objects in' + str(run_time.seconds) + 'sec')
     return run_time.seconds
 
 
@@ -61,7 +61,7 @@ def match_results(test_set, weaviate_result_set, k):
 
 def run_speed_test(l, CPUs,weaviate_url):
     '''Runs the actual speed test in Go'''
-    process = subprocess.Popen(['./benchmarker','dataset', '-u', weaviate_url, '-c', 'Benchmark', '-q', 'queries.json', '-p', str(CPUs), '-f', 'json', '-l', str(l)], stdout=subprocess.PIPE)
+    process = subprocess.Popen(['./benchmarker','dataset', '-u', weaviate_url, '-c', 'Benchmark_test', '-q', 'queries.json', '-p', str(CPUs), '-f', 'json', '-l', str(l)], stdout=subprocess.PIPE)
     result_raw = process.communicate()[0].decode('utf-8')
     return json.loads(result_raw)
 
@@ -168,6 +168,49 @@ def conduct_benchmark(weaviate_url, CPUs, ef, client, benchmark_file, efConstruc
 
     return results
 
+def conduct_benchmark_on_wiki_data(weaviate_url, CPUs, ef, client, benchmark_file, efConstruction, maxConnections):
+    '''Conducts the benchmark, note that the NN results
+       and speed test run seperatly from each other'''
+
+    # result obj
+    results = {
+        'benchmarkFile': benchmark_file[0],
+        'distanceMetric': benchmark_file[1],
+        'totalTested': 0,
+        'ef': ef,
+        'efConstruction': efConstruction,
+        'maxConnections': maxConnections,
+        'requestTimes': {}
+    }
+
+    # update schema for ef setting
+    loguru.logger.info('Update "ef" to ' + str(ef) + ' in schema')
+    client.schema.update_config('Benchmark_test', { 'vectorIndexConfig': { 'ef': ef } })
+
+    # Run the speed test
+    loguru.logger.info('Run the speed test')
+
+
+    benchmark_file = f"df_articles_0_overlapped_512_embedded.pkl"
+    with open('/var/pickle/' + benchmark_file, 'rb') as file:
+        df = pickle.load(file)
+        test_vector = df['encoded_content'][0:1000]
+
+        test_vectors_len = len(test_vector)
+        vector_write_array = []
+        for vector in test_vector:
+            vector_write_array.append(vector)
+        with open('queries.json', 'w', encoding='utf-8') as jf:
+            json.dump(vector_write_array, jf, indent=2)
+        results['requestTimes']['limit_1'] = run_speed_test(1, CPUs, weaviate_url)
+        results['requestTimes']['limit_10'] = run_speed_test(10, CPUs, weaviate_url)
+        results['requestTimes']['limit_100'] = run_speed_test(100, CPUs, weaviate_url)
+
+    # add final results
+    results['totalTested'] = test_vectors_len
+
+    return results
+
 
 def remove_weaviate_class(client):
     '''Removes the main class and tries again on error'''
@@ -207,6 +250,7 @@ def import_into_weaviate(client, efConstruction, maxConnections, benchmark_file)
                     "name": "counter"
                 }
             ],
+            "replicationConfig": {"factor": 3},
             "vectorIndexConfig": {
                 "ef": -1,
                 "efConstruction": efConstruction,
@@ -221,6 +265,7 @@ def import_into_weaviate(client, efConstruction, maxConnections, benchmark_file)
 
     # Import
     loguru.logger.info('Start import process for ' + benchmark_file[0] + ', ef' + str(efConstruction) + ', maxConnections' + str(maxConnections))
+    start_time = datetime.datetime.now()
     with h5py.File('/var/hdf5/' + benchmark_file[0], 'r') as f:
         vectors = f['train']
         c = 0
@@ -240,10 +285,78 @@ def import_into_weaviate(client, efConstruction, maxConnections, benchmark_file)
             c += 1
             batch_c += 1
         import_time += add_batch(client, c, vector_len)
-    loguru.logger.info('done importing ' + str(c) + ' objects in ' + str(import_time) + ' seconds')
+
+    stop_time = datetime.datetime.now()
+    loguru.logger.info('Done importing ' + str(c) + ' objects in ' + str((stop_time - start_time).seconds) + ' seconds')
+
+
 
     return import_time
 
+
+def import_wiki_into_weaviate(client, efConstruction, maxConnections):
+    '''Imports the data into Weaviate'''
+    
+    # variables
+    benchmark_import_batch_size = 10000
+    benchmark_class = 'Benchmark_test'
+    import_time = 0
+
+    # Delete schema if available
+    # current_schema = client.schema.get()
+    # if len(current_schema['classes']) > 0:
+    #     remove_weaviate_class(client)
+
+    # Create schema
+    schema = {
+        "classes": [{
+            "class": benchmark_class,
+            "description": "A class for benchmarking purposes",
+            "properties": [
+                {
+                    "dataType": [
+                        "int"
+                    ],
+                    "description": "The number of the couter in the dataset",
+                    "name": "counter"
+                }
+            ],
+            "vectorIndexConfig": {
+                "ef": -1,
+                "efConstruction": efConstruction,
+                "maxConnections": maxConnections,
+                "vectorCacheMaxObjects": 1000000000,
+                "distance": 'cosine'
+            }
+        }]
+    }
+
+    client.schema.create(schema)
+
+    # Import
+    for i in range(0, 5):
+        benchmark_file = f"df_articles_{i}_overlapped_512_embedded.pkl"
+        loguru.logger.info('Start import process for ' + benchmark_file + ', ef=' + str(efConstruction) + ', maxConnections=' + str(maxConnections))
+        with open('/var/pickle/' + benchmark_file, 'rb') as f:
+            df = pickle.load(f)
+            client.batch.configure(batch_size=benchmark_import_batch_size)  # Configure batch
+            start_time = datetime.datetime.now()
+            with client.batch as batch:
+                for _, data in df.iterrows():
+                    batch.add_data_object(
+                        data_object={
+                            "article_id": data['id'],
+                            "url": data['url'],
+                            "title": data['title'],
+                            "content": data['content']
+                        },
+                        vector=data['encoded_content'],
+                        class_name=benchmark_class
+                )
+            stop_time = datetime.datetime.now()
+            loguru.logger.info('Done importing ' + str(len(df)) + ' objects from ' + str(i) + 'th file in ' + str((stop_time - start_time).seconds) + ' seconds')
+
+    return import_time
 
 def run_the_benchmarks(weaviate_url, CPUs, efConstruction_array, maxConnections_array, ef_array, benchmark_file_array):
     '''Runs the actual benchmark.
@@ -264,15 +377,17 @@ def run_the_benchmarks(weaviate_url, CPUs, efConstruction_array, maxConnections_
     for benchmark_file in benchmark_file_array:
         for efConstruction in efConstruction_array:
             for maxConnections in maxConnections_array:
-               
                 # import data
-                import_time = import_into_weaviate(client, efConstruction, maxConnections, benchmark_file)
+                # import_wiki_into_weaviate(client, efConstruction, maxConnections)
+                # import_into_weaviate(client, efConstruction, maxConnections, benchmark_file)
 
                 # Find neighbors based on UUID and ef settings
                 results = []
                 for ef in ef_array:
-                    result = conduct_benchmark(weaviate_url, CPUs, ef, client, benchmark_file, efConstruction, maxConnections)
-                    result['importTime'] = import_time
+                    # result = conduct_benchmark(weaviate_url, CPUs, ef, client, benchmark_file, efConstruction, maxConnections)
+                    result = conduct_benchmark_on_wiki_data(weaviate_url, CPUs, ef, client, benchmark_file, efConstruction, maxConnections)
+
+                    result['importTime'] = 0
                     results.append(result)
                 
                 # write json file

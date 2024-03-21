@@ -7,6 +7,7 @@ services:
       dockerfile: Dockerfile-ann
     volumes:
       - $PWD/benchmark-data:/var/hdf5
+      - $PWD/embedded_wiki_512:/var/pickle
       - $PWD/results:/var/lib/benchmark/results
   weaviate:
     command:
